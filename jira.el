@@ -325,9 +325,16 @@ If nil, uses the project from jira config."
 (defun jira-my-issues ()
   "Show issues assigned to me."
   (interactive)
-  (let ((me (string-trim (jira--run-command "me"))))
-    (setq jira-current-filters (list "--assignee" me))
-    (jira-refresh)))
+  (let* ((me (string-trim (jira--run-command "me")))
+         (proj (or jira-default-project "Default")))
+    (with-current-buffer (get-buffer-create (format "*Jira: %s (My Issues)*" proj))
+      (jira-mode)
+      (setq jira-current-project proj)
+      (setq jira-current-filters (list "--assignee" me))
+      (jira--display-issues proj jira-current-filters)
+      (goto-char (point-min))
+      (forward-line 6)
+      (switch-to-buffer (current-buffer)))))
 
 (defun jira-watching ()
   "Show issues I'm watching."
