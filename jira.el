@@ -69,6 +69,10 @@ If nil, uses the project from jira config."
 
 ;;; Utility functions
 
+(defun jira--strip-ansi-codes (string)
+  "Remove ANSI color codes from STRING."
+  (replace-regexp-in-string "\033\\[[0-9;]*[mGKHf]" "" string))
+
 (defun jira--run-command (&rest args)
   "Run jira command with ARGS and return output."
   (with-temp-buffer
@@ -77,7 +81,7 @@ If nil, uses the project from jira config."
                        args))
            (exit-code (apply 'call-process jira-command nil t nil all-args)))
       (if (zerop exit-code)
-          (buffer-string)
+          (jira--strip-ansi-codes (buffer-string))
         (error "Jira command failed: %s" (buffer-string))))))
 
 (defun jira--run-command-json (&rest args)
