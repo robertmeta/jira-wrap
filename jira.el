@@ -164,9 +164,11 @@ If nil, uses the project from jira config."
 (defun jira--parse-issue-list-output (output)
   "Parse plain text OUTPUT from jira issue list into structured data."
   (let ((lines (split-string output "\n" t))
+        (assignee (if (boundp 'jira--filter-assignee) jira--filter-assignee "Unassigned"))
         issues)
     (dolist (line lines)
-      ;; Format is: TYPE\t\tKEY\tSUMMARY\t...\tSTATUS
+      ;; Format is: TYPE\tKEY\tSUMMARY\tSTATUS (when filtered)
+      ;; or TYPE\t\tKEY\tSUMMARY\t...\tSTATUS (when unfiltered)
       (let* ((parts (split-string line "\t" t))
              (type (or (nth 0 parts) ""))
              (key (or (nth 1 parts) ""))
@@ -177,7 +179,7 @@ If nil, uses the project from jira config."
                       :summary summary
                       :status status
                       :type type
-                      :assignee "Unknown"  ; Not in default output
+                      :assignee assignee
                       :priority "")
                 issues))))
     (nreverse issues)))
@@ -333,6 +335,8 @@ If nil, uses the project from jira config."
       (jira-mode)
       (setq jira-current-project proj)
       (setq jira-current-filters (list "--assignee" me))
+      ;; Store the assignee for display purposes
+      (setq-local jira--filter-assignee me)
       (jira--display-issues proj jira-current-filters)
       (goto-char (point-min))
       (forward-line 6)
