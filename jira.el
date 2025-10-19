@@ -166,21 +166,19 @@ If nil, uses the project from jira config."
   (let ((lines (split-string output "\n" t))
         issues)
     (dolist (line lines)
-      (when (string-match "^\\([A-Z]+-[0-9]+\\)\\s-+\\(.*\\)" line)
-        (let* ((key (match-string 1 line))
-               (rest (match-string 2 line))
-               (parts (split-string rest "\t"))
-               (type (or (nth 0 parts) ""))
-               (summary (or (nth 1 parts) ""))
-               (status (or (nth 2 parts) ""))
-               (assignee (or (nth 3 parts) ""))
-               (priority (or (nth 5 parts) "")))
+      ;; Format is: TYPE\t\tKEY\tSUMMARY\t...\tSTATUS
+      (let* ((parts (split-string line "\t" t))
+             (type (or (nth 0 parts) ""))
+             (key (or (nth 1 parts) ""))
+             (summary (or (nth 2 parts) ""))
+             (status (or (car (last parts)) "")))
+        (when (string-match "^[A-Z]+-[0-9]+$" key)
           (push (list :key key
                       :summary summary
                       :status status
                       :type type
-                      :assignee assignee
-                      :priority priority)
+                      :assignee "Unknown"  ; Not in default output
+                      :priority "")
                 issues))))
     (nreverse issues)))
 
