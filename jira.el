@@ -184,6 +184,7 @@ If nil, uses the project from jira config."
 
 (defun jira--display-issues (project filters)
   "Display issues from PROJECT with FILTERS applied."
+  (message "Loading Jira issues...")
   (let* ((args (list "issue" "list"))
          (args (if filters (append args filters) args))
          (output (apply 'jira--run-command-json args))
@@ -202,7 +203,8 @@ If nil, uses the project from jira config."
       (if (null issues)
           (insert "No issues found.\n")
         (dolist (issue issues)
-          (jira--insert-issue issue))))))
+          (jira--insert-issue issue))))
+    (message "Loaded %d Jira issues" (length issues))))
 
 ;;; Interactive commands
 
