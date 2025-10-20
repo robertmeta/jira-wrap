@@ -38,11 +38,11 @@ If nil, uses the project from jira config."
 (defvar jira-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") 'jira-view-issue-at-point)
-    (define-key map (kbd "c") 'jira-create-issue)
+    (define-key map (kbd "c") 'jira-comment-issue-at-point)
     (define-key map (kbd "e") 'jira-edit-issue-at-point)
     (define-key map (kbd "a") 'jira-assign-issue-at-point)
     (define-key map (kbd "m") 'jira-move-issue-at-point)
-    (define-key map (kbd "C") 'jira-comment-issue-at-point)
+    (define-key map (kbd "C") 'jira-create-issue)
     (define-key map (kbd "g") 'jira-refresh)
     (define-key map (kbd "o") 'jira-open-issue-in-browser)
     (define-key map (kbd "n") 'next-line)
@@ -84,13 +84,21 @@ If nil, uses the project from jira config."
           (jira--strip-ansi-codes (buffer-string))
         (error "Jira command failed: %s" (buffer-string))))))
 
+(defun jira--run-command-interactive (&rest args)
+  "Run jira command interactively with ARGS in a shell."
+  (let* ((all-args (if jira-default-project
+                       (append (list "--project" jira-default-project) args)
+                     args))
+         (cmd (mapconcat 'shell-quote-argument (cons jira-command all-args) " ")))
+    (async-shell-command cmd)))
+
 (defun jira--run-command-json (&rest args)
-  "Run jira command with ARGS and parse JSON output."
-  (let* ((all-args (append args '("--plain" "--no-headers")))
+  "Run jira command with ARGS and return JSON output as parsed Lisp data."
+  (let* ((all-args (append args '("--raw")))
          (output (apply 'jira--run-command all-args)))
     (if (string-empty-p output)
         nil
-      output)))
+      (json-read-from-string output))))
 
 (defun jira--parse-issue-key-at-point ()
   "Get the issue key at point."
@@ -165,27 +173,31 @@ If nil, uses the project from jira config."
         (put-text-property start (point) 'emacspeak-speak spoken-text)))
     (insert "\n")))
 
-(defun jira--parse-issue-list-output (output)
-  "Parse plain text OUTPUT from jira issue list into structured data."
-  (let ((lines (split-string output "\n" t))
-        (assignee (if (boundp 'jira--filter-assignee) jira--filter-assignee "Unassigned"))
-        issues)
-    (dolist (line lines)
-      ;; Format is: TYPE\tKEY\tSUMMARY\tSTATUS (when filtered)
-      ;; or TYPE\t\tKEY\tSUMMARY\t...\tSTATUS (when unfiltered)
-      (let* ((parts (split-string line "\t" t))
-             (type (or (nth 0 parts) ""))
-             (key (or (nth 1 parts) ""))
-             (summary (or (nth 2 parts) ""))
-             (status (or (car (last parts)) "")))
-        (when (string-match "^[A-Z]+-[0-9]+$" key)
-          (push (list :key key
-                      :summary summary
-                      :status status
-                      :type type
-                      :assignee assignee
-                      :priority "")
-                issues))))
+(defun jira--parse-issue-json (json-data)
+  "Parse JSON-DATA from jira issue list into structured data."
+  (let (issues)
+    (mapc (lambda (issue)
+            (let* ((key (alist-get 'key issue))
+                   (fields (alist-get 'fields issue))
+                   (summary (alist-get 'summary fields))
+                   (status (alist-get 'name (alist-get 'status fields)))
+                   (type (alist-get 'name (alist-get 'issueType fields)))
+                   (assignee-obj (alist-get 'assignee fields))
+                   (assignee (if assignee-obj
+                                (alist-get 'displayName assignee-obj)
+                              "Unassigned"))
+                   (priority-obj (alist-get 'priority fields))
+                   (priority (if priority-obj
+                                (alist-get 'name priority-obj)
+                              "")))
+              (push (list :key key
+                          :summary summary
+                          :status status
+                          :type type
+                          :assignee assignee
+                          :priority priority)
+                    issues)))
+          json-data)
     (nreverse issues)))
 
 (defun jira--display-issues (project filters)
@@ -193,8 +205,8 @@ If nil, uses the project from jira config."
   (message "Loading Jira issues...")
   (let* ((args (list "issue" "list"))
          (args (if filters (append args filters) args))
-         (output (apply 'jira--run-command-json args))
-         (issues (jira--parse-issue-list-output output)))
+         (json-data (apply 'jira--run-command-json args))
+         (issues (jira--parse-issue-json json-data)))
     (setq jira-issues-data issues)
     (let ((inhibit-read-only t))
       (erase-buffer)
@@ -202,7 +214,7 @@ If nil, uses the project from jira config."
       (when filters
         (insert (format " [Filtered: %s]" (mapconcat 'identity filters " "))))
       (insert "\n\n")
-      (insert "Commands: [RET] view  [c] create  [e] edit  [a] assign  [m] move  [C] comment  [g] refresh  [q] quit\n")
+      (insert "Commands: [RET] view  [c] comment  [e] edit  [a] assign  [m] move  [C] create  [g] refresh  [q] quit\n")
       (insert "Filters:  [s] status  [t] type  [A] assignee  [P] priority  [M] my issues  [W] watching  [S] sprints\n\n")
       (insert (format "%-12s %-10s %-12s %-15s %s\n" "KEY" "TYPE" "STATUS" "ASSIGNEE" "SUMMARY"))
       (insert (make-string 80 ?-) "\n")
@@ -241,80 +253,155 @@ If nil, uses the project from jira config."
   "View the full details of the issue at point."
   (interactive)
   (let ((key (jira--parse-issue-key-at-point)))
-    (when key
-      (jira-view-issue key))))
+    (unless key
+      (error "No issue at point"))
+    (jira-view-issue key)))
 
 (defun jira-view-issue (issue-key)
   "View details of ISSUE-KEY in a separate buffer."
   (interactive "sIssue key: ")
-  (let ((output (jira--run-command "issue" "view" issue-key)))
+  (let* ((json-data (jira--run-command-json "issue" "view" issue-key))
+         (fields (alist-get 'fields json-data))
+         (summary (alist-get 'summary fields))
+         (description (or (alist-get 'description fields) "No description"))
+         (status (alist-get 'name (alist-get 'status fields)))
+         (type (alist-get 'name (alist-get 'issueType fields)))
+         (assignee-obj (alist-get 'assignee fields))
+         (assignee (if assignee-obj
+                      (alist-get 'displayName assignee-obj)
+                    "Unassigned"))
+         (reporter-obj (alist-get 'reporter fields))
+         (reporter (if reporter-obj
+                      (alist-get 'displayName reporter-obj)
+                    "Unknown"))
+         (priority-obj (alist-get 'priority fields))
+         (priority (if priority-obj
+                      (alist-get 'name priority-obj)
+                    "None"))
+         (created (alist-get 'created fields))
+         (updated (alist-get 'updated fields)))
     (with-current-buffer (get-buffer-create (format "*Jira Issue: %s*" issue-key))
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (insert output)
+        (jira-issue-view-mode)
+        (setq-local jira-current-issue-key issue-key)
+        (setq-local jira-current-issue-data json-data)
+
+        ;; Header
+        (insert (propertize (format "%s: %s\n" issue-key (or summary "No summary"))
+                           'face 'bold 'font-lock-face 'bold))
+        (insert (make-string 80 ?=) "\n\n")
+
+        ;; Metadata
+        (insert (propertize "Type:      " 'face 'bold) (or type "Unknown") "\n")
+        (insert (propertize "Status:    " 'face 'bold) (or status "Unknown") "\n")
+        (insert (propertize "Priority:  " 'face 'bold) (or priority "None") "\n")
+        (insert (propertize "Assignee:  " 'face 'bold) (or assignee "Unassigned") "\n")
+        (insert (propertize "Reporter:  " 'face 'bold) (or reporter "Unknown") "\n")
+        (insert (propertize "Created:   " 'face 'bold) (or created "Unknown") "\n")
+        (insert (propertize "Updated:   " 'face 'bold) (or updated "Unknown") "\n\n")
+
+        ;; Description
+        (insert (propertize "Description:\n" 'face 'bold))
+        (insert (make-string 80 ?-) "\n")
+        (insert description "\n\n")
+
+        ;; Actions
+        (insert (make-string 80 ?=) "\n")
+        (insert (propertize "Actions:\n" 'face 'bold))
+        (insert "  [e] Edit issue\n")
+        (insert "  [a] Assign issue\n")
+        (insert "  [m] Move/transition status\n")
+        (insert "  [C] Add comment\n")
+        (insert "  [o] Open in browser\n")
+        (insert "  [g] Refresh\n")
+        (insert "  [q] Quit\n")
+
         (goto-char (point-min))
-        (view-mode)
         (switch-to-buffer (current-buffer))))))
 
-(defun jira-create-issue ()
-  "Create a new Jira issue interactively."
-  (interactive)
-  (jira--run-command "issue" "create")
-  (message "Creating issue...")
-  (jira-refresh))
+(defun jira-create-issue (summary type)
+  "Create a new Jira issue with SUMMARY and TYPE."
+  (interactive "sSummary: \nsType (e.g., Story, Task, Bug): ")
+  (jira--run-command-interactive "issue" "create" "--summary" summary "--type" type)
+  (message "Creating issue in shell buffer..."))
 
 (defun jira-edit-issue-at-point ()
-  "Edit the issue at point."
+  "Edit the issue at point.
+Prompts for what field to edit: summary, body, assignee, or priority."
   (interactive)
-  (let ((key (jira--parse-issue-key-at-point)))
-    (when key
-      (jira--run-command "issue" "edit" key)
-      (message "Editing %s..." key)
-      (jira-refresh))))
+  (let* ((key (jira--parse-issue-key-at-point))
+         (field (completing-read "Edit field: " '("summary" "body" "assignee" "priority" "labels") nil t))
+         (value (read-string (format "New %s: " field))))
+    (unless key
+      (error "No issue at point"))
+    (pcase field
+      ("summary" (jira--run-command "issue" "edit" key "--summary" value))
+      ("body" (jira--run-command "issue" "edit" key "--body" value))
+      ("assignee" (jira--run-command "issue" "edit" key "--assignee" value))
+      ("priority" (jira--run-command "issue" "edit" key "--priority" value))
+      ("labels" (jira--run-command "issue" "edit" key "--label" value)))
+    (message "Updated %s for %s" field key)
+    (jira-refresh)))
 
 (defun jira-assign-issue-at-point (assignee)
   "Assign the issue at point to ASSIGNEE."
   (interactive "sAssign to (email or display name): ")
   (let ((key (jira--parse-issue-key-at-point)))
-    (when key
-      (jira--run-command "issue" "assign" key assignee)
-      (message "Assigned %s to %s" key assignee)
-      (jira-refresh))))
+    (unless key
+      (error "No issue at point"))
+    (jira--run-command "issue" "assign" key assignee)
+    (message "Assigned %s to %s" key assignee)
+    (jira-refresh)))
 
 (defun jira-move-issue-at-point (status)
   "Move the issue at point to STATUS."
-  (interactive "sMove to status: ")
+  (interactive
+   (list (completing-read "Move to status: "
+                          '("To Do" "In Progress" "In Review" "Done" "Blocked" "Backlog")
+                          nil nil)))
   (let ((key (jira--parse-issue-key-at-point)))
-    (when key
-      (jira--run-command "issue" "move" key status)
-      (message "Moved %s to %s" key status)
-      (jira-refresh))))
+    (unless key
+      (error "No issue at point"))
+    (jira--run-command "issue" "move" key status)
+    (message "Moved %s to %s" key status)
+    (jira-refresh)))
 
-(defun jira-comment-issue-at-point ()
+(defun jira-comment-issue-at-point (comment)
   "Add a comment to the issue at point."
-  (interactive)
+  (interactive "sComment: ")
   (let ((key (jira--parse-issue-key-at-point)))
-    (when key
-      (jira--run-command "issue" "comment" "add" key)
-      (message "Adding comment to %s..." key))))
+    (unless key
+      (error "No issue at point"))
+    (when (string-empty-p comment)
+      (error "Comment cannot be empty"))
+    (jira--run-command "issue" "comment" "add" key comment)
+    (message "Added comment to %s" key)))
 
 (defun jira-open-issue-in-browser ()
   "Open the issue at point in a web browser."
   (interactive)
   (let ((key (jira--parse-issue-key-at-point)))
-    (when key
-      (jira--run-command "open" key)
-      (message "Opening %s in browser..." key))))
+    (unless key
+      (error "No issue at point"))
+    (jira--run-command "open" key)
+    (message "Opening %s in browser..." key)))
 
 (defun jira-filter-by-status (status)
   "Filter issues by STATUS."
-  (interactive "sFilter by status: ")
+  (interactive
+   (list (completing-read "Filter by status: "
+                          '("To Do" "In Progress" "In Review" "Done" "Blocked" "Backlog" "Open" "Closed" "Reopened")
+                          nil nil)))
   (setq jira-current-filters (list "--status" status))
   (jira-refresh))
 
 (defun jira-filter-by-type (type)
   "Filter issues by TYPE."
-  (interactive "sFilter by type: ")
+  (interactive
+   (list (completing-read "Filter by type: "
+                          '("Story" "Task" "Bug" "Epic" "Subtask" "Spike" "Improvement")
+                          nil nil)))
   (setq jira-current-filters (list "--type" type))
   (jira-refresh))
 
@@ -326,21 +413,22 @@ If nil, uses the project from jira config."
 
 (defun jira-filter-by-priority (priority)
   "Filter issues by PRIORITY."
-  (interactive "sFilter by priority: ")
+  (interactive
+   (list (completing-read "Filter by priority: "
+                          '("Highest" "High" "Medium" "Low" "Lowest")
+                          nil nil)))
   (setq jira-current-filters (list "--priority" priority))
   (jira-refresh))
 
 (defun jira-my-issues ()
-  "Show issues assigned to me."
+  "Show issues assigned to me, excluding Done and Cancelled issues."
   (interactive)
   (let* ((me (string-trim (jira--run-command "me")))
          (proj (or jira-default-project "Default")))
     (with-current-buffer (get-buffer-create (format "*Jira: %s (My Issues)*" proj))
       (jira-mode)
       (setq jira-current-project proj)
-      (setq jira-current-filters (list "--assignee" me))
-      ;; Store the assignee for display purposes
-      (setq-local jira--filter-assignee me)
+      (setq jira-current-filters (list "--assignee" me "--status" "~Done" "--status" "~Cancelled" "--status" "~Canceled"))
       (jira--display-issues proj jira-current-filters)
       (goto-char (point-min))
       (forward-line 6)
@@ -363,6 +451,78 @@ If nil, uses the project from jira config."
         (goto-char (point-min))
         (view-mode)
         (switch-to-buffer (current-buffer))))))
+
+;;; Issue view mode
+
+(defvar-local jira-current-issue-key nil
+  "The issue key being viewed in the current buffer.")
+
+(defvar-local jira-current-issue-data nil
+  "The full JSON data for the issue being viewed.")
+
+(defvar jira-issue-view-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "e") 'jira-issue-view-edit)
+    (define-key map (kbd "a") 'jira-issue-view-assign)
+    (define-key map (kbd "m") 'jira-issue-view-move)
+    (define-key map (kbd "C") 'jira-issue-view-comment)
+    (define-key map (kbd "o") 'jira-issue-view-open-browser)
+    (define-key map (kbd "g") 'jira-issue-view-refresh)
+    (define-key map (kbd "q") 'quit-window)
+    map)
+  "Keymap for `jira-issue-view-mode'.")
+
+(define-derived-mode jira-issue-view-mode special-mode "Jira-Issue"
+  "Major mode for viewing a single Jira issue.
+
+\\{jira-issue-view-mode-map}"
+  (setq buffer-read-only t))
+
+(defun jira-issue-view-edit ()
+  "Edit the current issue."
+  (interactive)
+  (when jira-current-issue-key
+    (jira--run-command "issue" "edit" jira-current-issue-key)
+    (message "Editing %s..." jira-current-issue-key)
+    (jira-issue-view-refresh)))
+
+(defun jira-issue-view-assign ()
+  "Assign the current issue to someone."
+  (interactive)
+  (when jira-current-issue-key
+    (let ((assignee (read-string "Assign to (email or name): ")))
+      (jira--run-command "issue" "assign" jira-current-issue-key assignee)
+      (message "Assigned %s to %s" jira-current-issue-key assignee)
+      (jira-issue-view-refresh))))
+
+(defun jira-issue-view-move ()
+  "Move/transition the current issue to a new status."
+  (interactive)
+  (when jira-current-issue-key
+    (let ((status (read-string "Move to status: ")))
+      (jira--run-command "issue" "move" jira-current-issue-key status)
+      (message "Moved %s to %s" jira-current-issue-key status)
+      (jira-issue-view-refresh))))
+
+(defun jira-issue-view-comment ()
+  "Add a comment to the current issue."
+  (interactive)
+  (when jira-current-issue-key
+    (jira--run-command "issue" "comment" "add" jira-current-issue-key)
+    (message "Adding comment to %s..." jira-current-issue-key)))
+
+(defun jira-issue-view-open-browser ()
+  "Open the current issue in a web browser."
+  (interactive)
+  (when jira-current-issue-key
+    (jira--run-command "open" jira-current-issue-key)
+    (message "Opening %s in browser..." jira-current-issue-key)))
+
+(defun jira-issue-view-refresh ()
+  "Refresh the current issue view."
+  (interactive)
+  (when jira-current-issue-key
+    (jira-view-issue jira-current-issue-key)))
 
 ;;; Major mode
 
