@@ -35,6 +35,31 @@ If nil, uses the project from jira config."
   :type 'integer
   :group 'jira)
 
+(defcustom jira-before-move-hook nil
+  "Hook run before moving an issue to a new status.
+Functions are called with three arguments: ISSUE-KEY, OLD-STATUS, NEW-STATUS.
+If any function returns nil, the move is cancelled."
+  :type 'hook
+  :group 'jira)
+
+(defcustom jira-after-move-hook nil
+  "Hook run after successfully moving an issue to a new status.
+Functions are called with three arguments: ISSUE-KEY, OLD-STATUS, NEW-STATUS."
+  :type 'hook
+  :group 'jira)
+
+(defcustom jira-before-edit-hook nil
+  "Hook run before editing an issue.
+Functions are called with two arguments: ISSUE-KEY and FIELD."
+  :type 'hook
+  :group 'jira)
+
+(defcustom jira-after-edit-hook nil
+  "Hook run after successfully editing an issue.
+Functions are called with three arguments: ISSUE-KEY, FIELD, and VALUE."
+  :type 'hook
+  :group 'jira)
+
 (defvar jira-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "RET") 'jira-view-issue-at-point)
@@ -44,6 +69,7 @@ If nil, uses the project from jira config."
     (define-key map (kbd "m") 'jira-move-issue-at-point)
     (define-key map (kbd "C") 'jira-create-issue)
     (define-key map (kbd "g") 'jira-refresh)
+    (define-key map (kbd "r") 'jira-refresh)  ; Alternative refresh key (reminders pattern)
     (define-key map (kbd "o") 'jira-open-issue-in-browser)
     (define-key map (kbd "n") 'next-line)
     (define-key map (kbd "p") 'previous-line)
@@ -55,6 +81,7 @@ If nil, uses the project from jira config."
     (define-key map (kbd "S") 'jira-show-sprints)
     (define-key map (kbd "M") 'jira-my-issues)
     (define-key map (kbd "W") 'jira-watching)
+    (define-key map (kbd "?") 'jira-help)
     map)
   "Keymap for `jira-mode'.")
 
@@ -214,7 +241,7 @@ If nil, uses the project from jira config."
       (when filters
         (insert (format " [Filtered: %s]" (mapconcat 'identity filters " "))))
       (insert "\n\n")
-      (insert "Commands: [RET] view  [c] comment  [e] edit  [a] assign  [m] move  [C] create  [g] refresh  [q] quit\n")
+      (insert "Commands: [RET] view  [c] comment  [e] edit  [a] assign  [m] move  [C] create  [g/r] refresh  [?] help  [q] quit\n")
       (insert "Filters:  [s] status  [t] type  [A] assignee  [P] priority  [M] my issues  [W] watching  [S] sprints\n\n")
       (insert (format "%-12s %-10s %-12s %-15s %s\n" "KEY" "TYPE" "STATUS" "ASSIGNEE" "SUMMARY"))
       (insert (make-string 80 ?-) "\n")
@@ -312,9 +339,10 @@ If nil, uses the project from jira config."
         (insert "  [e] Edit issue\n")
         (insert "  [a] Assign issue\n")
         (insert "  [m] Move/transition status\n")
-        (insert "  [C] Add comment\n")
+        (insert "  [c/C] Add comment\n")
         (insert "  [o] Open in browser\n")
-        (insert "  [g] Refresh\n")
+        (insert "  [g/r] Refresh\n")
+        (insert "  [?] Help\n")
         (insert "  [q] Quit\n")
 
         (goto-char (point-min))
@@ -335,6 +363,8 @@ Prompts for what field to edit: summary, body, assignee, or priority."
          (value (read-string (format "New %s: " field))))
     (unless key
       (error "No issue at point"))
+    ;; Run before-edit hook
+    (run-hook-with-args 'jira-before-edit-hook key field)
     (pcase field
       ("summary" (jira--run-command "issue" "edit" key "--summary" value))
       ("body" (jira--run-command "issue" "edit" key "--body" value))
@@ -342,6 +372,8 @@ Prompts for what field to edit: summary, body, assignee, or priority."
       ("priority" (jira--run-command "issue" "edit" key "--priority" value))
       ("labels" (jira--run-command "issue" "edit" key "--label" value)))
     (message "Updated %s for %s" field key)
+    ;; Run after-edit hook
+    (run-hook-with-args 'jira-after-edit-hook key field value)
     (jira-refresh)))
 
 (defun jira-assign-issue-at-point (assignee)
@@ -360,12 +392,18 @@ Prompts for what field to edit: summary, body, assignee, or priority."
    (list (completing-read "Move to status: "
                           '("To Do" "In Progress" "In Review" "Done" "Blocked" "Backlog")
                           nil nil)))
-  (let ((key (jira--parse-issue-key-at-point)))
+  (let* ((key (jira--parse-issue-key-at-point))
+         (issue-data (jira--parse-issue-data-at-point))
+         (old-status (when issue-data (plist-get issue-data :status))))
     (unless key
       (error "No issue at point"))
-    (jira--run-command "issue" "move" key status)
-    (message "Moved %s to %s" key status)
-    (jira-refresh)))
+    ;; Run before-move hook - if any function returns nil, cancel the move
+    (when (run-hook-with-args-until-failure 'jira-before-move-hook key old-status status)
+      (jira--run-command "issue" "move" key status)
+      (message "Moved %s to %s" key status)
+      ;; Run after-move hook
+      (run-hook-with-args 'jira-after-move-hook key old-status status)
+      (jira-refresh))))
 
 (defun jira-comment-issue-at-point (comment)
   "Add a comment to the issue at point."
@@ -452,6 +490,183 @@ Prompts for what field to edit: summary, body, assignee, or priority."
         (view-mode)
         (switch-to-buffer (current-buffer))))))
 
+(defun jira-help ()
+  "Display help for Jira mode keybindings."
+  (interactive)
+  (let ((evil-enabled (and (boundp 'evil-mode) evil-mode)))
+    (with-current-buffer (get-buffer-create "*Jira Help*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (propertize "Jira Mode Help\n" 'face 'bold))
+        (insert (make-string 80 ?=) "\n\n")
+
+        ;; Navigation
+        (insert (propertize "Navigation:\n" 'face 'bold))
+        (insert "  RET / Enter    View issue details\n")
+        (insert "  n / j          Next line\n")
+        (insert "  p / k          Previous line\n")
+        (insert "  q              Quit window\n")
+        (if evil-enabled
+            (insert "  ZZ / ZQ        Quit window (Vim-style)\n")
+          (insert "\n"))
+        (insert "\n")
+
+        ;; Issue Actions
+        (insert (propertize "Issue Actions:\n" 'face 'bold))
+        (insert "  c              Add comment to issue\n")
+        (insert "  e")
+        (when evil-enabled (insert " / E"))
+        (insert "              Edit issue (summary, body, assignee, priority, labels)\n")
+        (insert "  a              Assign issue to someone\n")
+        (insert "  m              Move issue to different status\n")
+        (insert "  C              Create new issue\n")
+        (insert "  o              Open issue in web browser\n")
+        (insert "  g")
+        (when evil-enabled (insert " / r / R"))
+        (insert "            Refresh current view")
+        (when evil-enabled (insert " (also: gr)"))
+        (insert "\n\n")
+
+        ;; Filters
+        (insert (propertize "Filters:\n" 'face 'bold))
+        (insert "  s              Filter by status\n")
+        (insert "  t              Filter by type\n")
+        (insert "  A              Filter by assignee\n")
+        (insert "  P              Filter by priority\n\n")
+
+        ;; Views
+        (insert (propertize "Views:\n" 'face 'bold))
+        (insert "  M              Show my issues (excluding Done/Cancelled)\n")
+        (insert "  W              Show issues I'm watching\n")
+        (insert "  S              Show active sprints\n\n")
+
+        ;; Help
+        (insert (propertize "Help:\n" 'face 'bold))
+        (insert "  ?              Show this help message\n\n")
+
+        ;; Evil mode notice
+        (when evil-enabled
+          (insert (make-string 80 ?-) "\n")
+          (insert (propertize "Evil Mode:\n" 'face 'bold))
+          (insert "Evil mode is active with Vim-style keybindings:\n\n")
+          (insert (propertize "Additional Evil Keybindings:\n" 'face 'bold))
+          (insert "  j / k          Navigate down/up (same as n/p)\n")
+          (insert "  gg             Go to first issue\n")
+          (insert "  G              Go to last issue\n")
+          (insert "  r / R          Refresh (like reminders-mode)\n")
+          (insert "  gr             Refresh (Vim-style)\n")
+          (insert "  ZZ / ZQ        Quit window (Vim-style)\n")
+          (insert "  E / A / M      Uppercase variants work same as lowercase\n\n")
+          (insert (propertize "Pattern Consistency:\n" 'face 'bold))
+          (insert "Following reminders-mode patterns for familiarity:\n")
+          (insert "  r/R for refresh, uppercase variants for common actions\n\n"))
+
+        ;; Customization section
+        (insert (make-string 80 ?=) "\n")
+        (insert (propertize "CUSTOMIZATION\n" 'face 'bold))
+        (insert (make-string 80 ?=) "\n\n")
+        (insert "Jira-wrap is designed to be customizable for your organization's workflows.\n")
+        (insert "Add customizations to your init.el or ~/.emacs.d/init.el file.\n\n")
+
+        ;; Example 1: Resolution field when moving to Done
+        (insert (propertize "Example 1: Require Resolution Field When Moving to Done\n" 'face 'bold))
+        (insert (make-string 80 ?-) "\n")
+        (insert "Many organizations require a \"resolution\" field when closing issues.\n")
+        (insert "Add this to your init.el:\n\n")
+        (insert (propertize
+                 "(defun my-jira-require-resolution (key old-status new-status)
+  \"Prompt for resolution when moving to Done status.\"
+  (if (string-match-p \"Done\\\\|Closed\\\\|Resolved\" new-status)
+      (let ((resolution (completing-read
+                         (format \"Resolution for %s: \" key)
+                         '(\"Fixed\" \"Won't Fix\" \"Duplicate\" \"Cannot Reproduce\"
+                           \"Works as Designed\" \"Incomplete\")
+                         nil nil)))
+        (when (not (string-empty-p resolution))
+          ;; Set the resolution field using jira CLI
+          (shell-command
+           (format \"jira issue edit %s --custom resolution=%s\"
+                   (shell-quote-argument key)
+                   (shell-quote-argument resolution)))
+          (message \"Set resolution to: %s\" resolution))
+        t)  ; Return t to allow the move to proceed
+    t))  ; Return t for non-Done statuses
+
+(add-hook 'jira-before-move-hook 'my-jira-require-resolution)\n\n"
+                 'face 'font-lock-comment-face))
+
+        ;; Example 2: Custom fields
+        (insert (propertize "Example 2: Set Custom Fields When Moving\n" 'face 'bold))
+        (insert (make-string 80 ?-) "\n")
+        (insert "Set custom fields automatically during transitions:\n\n")
+        (insert (propertize
+                 "(defun my-jira-auto-set-custom-field (key old-status new-status)
+  \"Automatically set a custom field when moving to In Review.\"
+  (when (string-match-p \"In Review\" new-status)
+    (shell-command
+     (format \"jira issue edit %s --custom 'Code Review Required=Yes'\"
+             (shell-quote-argument key))))
+  t)  ; Always return t to allow move
+
+(add-hook 'jira-before-move-hook 'my-jira-auto-set-custom-field)\n\n"
+                 'face 'font-lock-comment-face))
+
+        ;; Example 3: Validation
+        (insert (propertize "Example 3: Prevent Moves Without Assignee\n" 'face 'bold))
+        (insert (make-string 80 ?-) "\n")
+        (insert "Block transitions if certain conditions aren't met:\n\n")
+        (insert (propertize
+                 "(defun my-jira-require-assignee-for-in-progress (key old-status new-status)
+  \"Prevent moving to In Progress without an assignee.\"
+  (if (string-match-p \"In Progress\" new-status)
+      ;; Check if issue has an assignee (you'd need to fetch issue data)
+      (if (y-or-n-p \"Is this issue assigned to someone? \")
+          t    ; Allow the move
+        (message \"Please assign the issue before moving to In Progress\")
+        nil)   ; Block the move by returning nil
+    t))  ; Allow moves to other statuses
+
+(add-hook 'jira-before-move-hook 'my-jira-require-assignee-for-in-progress)\n\n"
+                 'face 'font-lock-comment-face))
+
+        ;; Example 4: Using advice for deeper customization
+        (insert (propertize "Example 4: Using Advice for Complex Customizations\n" 'face 'bold))
+        (insert (make-string 80 ?-) "\n")
+        (insert "For more complex scenarios, use Emacs advice system:\n\n")
+        (insert (propertize
+                 "(defun my-jira-custom-move-behavior (orig-fun &rest args)
+  \"Wrap the move function to add custom behavior.\"
+  (let ((result (apply orig-fun args)))
+    ;; Do something after the move completes
+    (message \"Issue moved successfully! Running custom post-move actions...\")
+    result))
+
+(advice-add 'jira-move-issue-at-point :around #'my-jira-custom-move-behavior)\n\n"
+                 'face 'font-lock-comment-face))
+
+        ;; Available hooks summary
+        (insert (propertize "Available Customization Hooks:\n" 'face 'bold))
+        (insert (make-string 80 ?-) "\n")
+        (insert "  jira-before-move-hook    - Called before moving issue (can cancel)\n")
+        (insert "  jira-after-move-hook     - Called after successful move\n")
+        (insert "  jira-before-edit-hook    - Called before editing issue\n")
+        (insert "  jira-after-edit-hook     - Called after successful edit\n\n")
+
+        (insert (propertize "Hook Function Arguments:\n" 'face 'bold))
+        (insert "  before/after-move: (issue-key old-status new-status)\n")
+        (insert "  before-edit: (issue-key field)\n")
+        (insert "  after-edit: (issue-key field value)\n\n")
+
+        (insert (propertize "Tips:\n" 'face 'bold))
+        (insert "  • Before-move hooks that return nil will cancel the move\n")
+        (insert "  • Use shell-command or jira--run-command to interact with jira CLI\n")
+        (insert "  • Test your hooks with simple messages before adding logic\n")
+        (insert "  • Check the jira CLI documentation for available fields and options\n\n")
+
+        (goto-char (point-min))
+        (view-mode)
+        (switch-to-buffer (current-buffer))))))
+
 ;;; Issue view mode
 
 (defvar-local jira-current-issue-key nil
@@ -465,9 +680,12 @@ Prompts for what field to edit: summary, body, assignee, or priority."
     (define-key map (kbd "e") 'jira-issue-view-edit)
     (define-key map (kbd "a") 'jira-issue-view-assign)
     (define-key map (kbd "m") 'jira-issue-view-move)
+    (define-key map (kbd "c") 'jira-issue-view-comment)
     (define-key map (kbd "C") 'jira-issue-view-comment)
     (define-key map (kbd "o") 'jira-issue-view-open-browser)
     (define-key map (kbd "g") 'jira-issue-view-refresh)
+    (define-key map (kbd "r") 'jira-issue-view-refresh)  ; Alternative refresh key
+    (define-key map (kbd "?") 'jira-help)
     (define-key map (kbd "q") 'quit-window)
     map)
   "Keymap for `jira-issue-view-mode'.")
@@ -499,10 +717,16 @@ Prompts for what field to edit: summary, body, assignee, or priority."
   "Move/transition the current issue to a new status."
   (interactive)
   (when jira-current-issue-key
-    (let ((status (read-string "Move to status: ")))
-      (jira--run-command "issue" "move" jira-current-issue-key status)
-      (message "Moved %s to %s" jira-current-issue-key status)
-      (jira-issue-view-refresh))))
+    (let* ((status (read-string "Move to status: "))
+           (fields (alist-get 'fields jira-current-issue-data))
+           (old-status (alist-get 'name (alist-get 'status fields))))
+      ;; Run before-move hook - if any function returns nil, cancel the move
+      (when (run-hook-with-args-until-failure 'jira-before-move-hook jira-current-issue-key old-status status)
+        (jira--run-command "issue" "move" jira-current-issue-key status)
+        (message "Moved %s to %s" jira-current-issue-key status)
+        ;; Run after-move hook
+        (run-hook-with-args 'jira-after-move-hook jira-current-issue-key old-status status)
+        (jira-issue-view-refresh)))))
 
 (defun jira-issue-view-comment ()
   "Add a comment to the current issue."
@@ -546,7 +770,64 @@ Prompts for what field to edit: summary, body, assignee, or priority."
 ;;; Evil mode integration
 
 (with-eval-after-load 'evil
-  (evil-set-initial-state 'jira-mode 'emacs))
+  ;; Use normal state for jira-mode (Vim-like navigation)
+  (evil-set-initial-state 'jira-mode 'normal)
+  (evil-set-initial-state 'jira-issue-view-mode 'normal)
+
+  ;; Define Evil keybindings for jira-mode
+  (evil-define-key 'normal jira-mode-map
+    (kbd "RET") 'jira-view-issue-at-point
+    "j" 'next-line
+    "k" 'previous-line
+    "c" 'jira-comment-issue-at-point
+    "e" 'jira-edit-issue-at-point
+    "E" 'jira-edit-issue-at-point        ; Uppercase variant for consistency
+    "a" 'jira-assign-issue-at-point
+    "A" 'jira-filter-by-assignee         ; Keep A for assignee filter
+    "m" 'jira-move-issue-at-point
+    "M" 'jira-my-issues                  ; Keep M for my issues
+    "C" 'jira-create-issue
+    "r" 'jira-refresh                    ; Primary refresh key (reminders pattern)
+    "R" 'jira-refresh                    ; Uppercase variant
+    "g" nil                              ; Prefix key for 'gr' and 'gg'
+    "gr" 'jira-refresh                   ; Vim-style refresh (still available)
+    "gg" 'evil-goto-first-line
+    "G" 'evil-goto-line
+    "o" 'jira-open-issue-in-browser
+    "q" 'quit-window
+    "ZZ" 'quit-window                    ; Vim-style quit
+    "ZQ" 'quit-window                    ; Vim-style force quit
+    "s" 'jira-filter-by-status
+    "t" 'jira-filter-by-type
+    "P" 'jira-filter-by-priority
+    "S" 'jira-show-sprints
+    "W" 'jira-watching
+    "?" 'jira-help)
+
+  ;; Define Evil keybindings for jira-issue-view-mode
+  (evil-define-key 'normal jira-issue-view-mode-map
+    (kbd "RET") 'jira-view-issue-at-point
+    "j" 'next-line
+    "k" 'previous-line
+    "e" 'jira-issue-view-edit
+    "E" 'jira-issue-view-edit            ; Uppercase variant
+    "a" 'jira-issue-view-assign
+    "A" 'jira-issue-view-assign          ; Uppercase variant
+    "m" 'jira-issue-view-move
+    "M" 'jira-issue-view-move            ; Uppercase variant
+    "c" 'jira-issue-view-comment
+    "C" 'jira-issue-view-comment
+    "o" 'jira-issue-view-open-browser
+    "r" 'jira-issue-view-refresh         ; Primary refresh key
+    "R" 'jira-issue-view-refresh         ; Uppercase variant
+    "g" nil                              ; Prefix key for 'gr' and 'gg'
+    "gr" 'jira-issue-view-refresh        ; Vim-style refresh
+    "gg" 'evil-goto-first-line
+    "G" 'evil-goto-line
+    "q" 'quit-window
+    "ZZ" 'quit-window                    ; Vim-style quit
+    "ZQ" 'quit-window                    ; Vim-style force quit
+    "?" 'jira-help))
 
 ;;; Emacspeak advice
 

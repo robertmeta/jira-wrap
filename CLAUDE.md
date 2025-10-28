@@ -83,6 +83,24 @@ Beyond `jira-list-issues`, these standalone commands are also available:
 - `jira-watching` - Show issues you're watching
 - `jira-view-issue` - View a specific issue by key
 
+## Customization Hooks
+
+Jira-wrap provides hooks for customizing workflow behavior without modifying the core code:
+
+- **`jira-before-move-hook`** - Called before moving an issue to a new status. Functions receive `(issue-key old-status new-status)`. If any function returns `nil`, the move is cancelled.
+- **`jira-after-move-hook`** - Called after successfully moving an issue. Functions receive `(issue-key old-status new-status)`.
+- **`jira-before-edit-hook`** - Called before editing an issue. Functions receive `(issue-key field)`.
+- **`jira-after-edit-hook`** - Called after editing an issue. Functions receive `(issue-key field value)`.
+
+### Common Use Cases
+
+1. **Requiring Resolution Field**: Prompt for a resolution field when moving to "Done" status
+2. **Custom Field Validation**: Enforce org-specific field requirements during transitions
+3. **Automated Workflows**: Auto-set fields based on status transitions
+4. **Audit Logging**: Track issue changes for compliance
+
+See the in-app help (`?` key) for detailed examples of using these hooks in init.el.
+
 ## Code Conventions
 
 - Use `jira--` prefix for private functions
@@ -90,3 +108,4 @@ Beyond `jira-list-issues`, these standalone commands are also available:
 - Buffer-local variables use `defvar-local`
 - Emacspeak integration uses `with-eval-after-load` and advice to avoid hard dependency
 - Evil mode integration also uses `with-eval-after-load` to avoid hard dependency
+- Hooks use `run-hook-with-args` for after-hooks and `run-hook-with-args-until-failure` for before-hooks that can cancel operations
