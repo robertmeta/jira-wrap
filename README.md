@@ -1,5 +1,9 @@
 # jira.el - Emacs Interface for Jira CLI
 
+<p align="center">
+  <img src="logo.png" alt="jira-wrap logo" width="200">
+</p>
+
 An Emacs package providing a full-featured interface to the Jira CLI tool, with enhanced accessibility support for Emacspeak users.
 
 ## Features
